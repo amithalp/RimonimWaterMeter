@@ -4,7 +4,7 @@
 3. Consider adding alert triggers for water leaks - For now use lastConsumptionValue with RM to trigger alerts
 4. Consider feching Meter and Account Details as seen in the web site - https://c.mtr-smart.net/consumer
 5. Add .AspNetCore.Culture attribute (done) and extract is from first httpGet response
-6. Clean code and upload to Github
+6. Clean code and upload to Github - Done
 */
 
 /****Instructions: ************
