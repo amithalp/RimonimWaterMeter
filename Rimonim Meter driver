@@ -1,0 +1,748 @@
+/*****To Do list****************
+1. Add "This month consumptiom" device attribute
+2. Add last consumption date and last consumption value device attributes  - Done
+3. Consider adding alert triggers for water leaks - For now use lastConsumptionValue with RM to trigger alerts
+4. Consider feching Meter and Account Details as seen in the web site - https://c.mtr-smart.net/consumer
+5. Add .AspNetCore.Culture attribute (done) and extract is from first httpGet response
+6. Clean code and upload to Github
+*/
+
+/****Instructions: ************
+To use this driver work you will need a Billing ID, Meter Number and Password for the https://c.mtr-smart.net water company site.
+Collected data is sent to InfluxDB
+You can use Grafana to get the data from InfluxDB and an Iframe device to present the graphs on the dashboard*/
+
+
+/*****************************************************************************************************************
+ *  Raw Source: https://github.com/____________________________________
+ *  License:
+ *   Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
+ *   in compliance with the License. You may obtain a copy of the License at:
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ *   Unless required by applicable law or agreed to in writing, software distributed under the License is distributed
+ *   on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the License
+ *   for the specific language governing permissions and limitations under the License.
+ *
+ *   Modifcation History
+ *   Version     Date           Name            Change
+ *   1.0.0       2024-12-11     amithalp        Initial public release
+ *   1.0.1		   2025-04-15		  amithalp		    Add lastConsumptionDate and lastConsumptionValue attributes
+ *****************************************************************************************************************/
+
+import java.time.LocalDate;
+import java.time.format.DateTimeFormatter;
+import groovy.json.JsonSlurper;
+
+
+metadata {
+    definition(name: "Rimonim Meter", namespace: "amithalp", author: "Amit Halperin", version: "1.0.1") {
+        capability "Actuator"
+        capability "Refresh"
+        capability "Sensor"
+        
+        attribute "requestVerificationToken", "string"
+        attribute "antiforgeryCookie", "string"
+        //attribute "cultureCookie", "string"
+        attribute "aspNetCoreCookies", "string"
+        attribute "infCookie", "string"
+        attribute "waterSiteUrl", "string"
+        attribute "billingId", "string"
+        attribute "meterNumber", "string"
+        attribute "password", "string"
+        attribute "fromDate", "string"
+        attribute "toDate", "string"
+        attribute "influxdbHost", "string"
+        attribute "influxDBPort", "number"        
+        attribute "orgName", "string"
+        attribute "bucketName", "string"
+        attribute "influxdbToken", "string"
+        attribute "consumptionData", "string"
+        attribute "lastPollDate", "string"
+        attribute "reportType", "number"
+		attribute "lastConsumptionDate", "string"
+		attribute "lastConsumptionValue", "number"
+
+
+        command "getConsumptionDataManually"
+        command "deleteAllCookies"
+        command "initialize"
+        }
+}
+
+preferences {
+    // Instructions for the user as a read-only field
+    input name: "instructions", type: "text", title: "Instructions", description: "Change a field value and then click 'Save Preferences' and 'Save Device' to update the attributes. Note that fromDate and toDate are only considered when you use Get Consuption Data Manually. Scheduled updates run for the last 7 days", required: false, submitOnChange: false
+ 
+    input "waterSiteUrl", "text", title: "Water Website Base URL", description: "e.g., https://c.mtr-smart.net/", required: true
+    input "billingId", "text", title: "Billing ID", required: true, description: "The same Billing ID you use to login to the water company web site"
+    input "meterNumber", "text", title: "Meter Number", required: true, description: "The same Meter Number you use to login to the water company web site. Also printed on the meter itself"
+    input "password", "password", title: "Password", required: true, description: "The same Password you use to login to the water company web site"
+    input "influxdbHost", "text", title: "InfluxDB Host", required: true, description: "URL for the machine hosting InfluxDB. Use format ex - 192.168.1.1"
+    input "influxDBPort", "number", title: "InfluxDB Port", defaultValue: 8086, required: true
+    input "orgName", "text", title: "InfluxDB Organization Name", required: true
+    input "bucketName", "text", title: "InfluxDB Bucket Name", required: true
+    input "influxdbToken", "password", title: "InfluxDB Token", required: true
+    input "enableDebug", "bool", title: "Enable Debug Logging?", defaultValue: true
+
+    def defaultFromDate = getDefaultFromDate()
+    def defaultToDate = getDefaultToDate()
+    def defaultReportType = getDefaultReportType()
+
+    input "reportType", "reportType", title: "Report Type", required: true, description: "1=Daily, 3=Monthly", defaultValue: 1
+    input "fromDate", "text", title: "From Date (yyyy-MM-dd)", description: "Enter the start date for data retrieval", defaultValue: defaultFromDate, required: true
+    input "toDate", "text", title: "To Date (yyyy-MM-dd)", description: "Enter the end date for data retrieval", defaultValue: defaultToDate, required: true
+    input "updateFrequency", "number", title: "Update Frequency (hours)", description: "How often to schedule the update flow to run", defaultValue: 6, required: true
+
+}
+
+def installed() {
+    initializeAttributes()
+}
+
+def updated() {
+    debugLog("Preferences updated.")
+
+    // Ensure all preferences are set before updating attributes
+    if (!settings.waterSiteUrl || !settings.billingId || !settings.meterNumber || !settings.password || 
+        !settings.influxdbHost || !settings.orgName || !settings.bucketName || !settings.influxdbToken || 
+        !settings.fromDate ||!settings.toDate) {
+        log.warn "One or more preferences are not set. Please save preferences first."
+        return
+    }
+
+    // Update all attributes based on preferences
+    sendEvent(name: "waterSiteUrl", value: settings.waterSiteUrl, isStateChange: true)
+    sendEvent(name: "billingId", value: settings.billingId, isStateChange: true)
+    sendEvent(name: "meterNumber", value: settings.meterNumber, isStateChange: true)
+    sendEvent(name: "password", value: settings.password, isStateChange: true)
+    sendEvent(name: "influxdbHost", value: settings.influxdbHost, isStateChange: true)
+    sendEvent(name: "influxDBPort", value: settings.influxDBPort, isStateChange: true)
+    sendEvent(name: "orgName", value: settings.orgName, isStateChange: true)
+    sendEvent(name: "bucketName", value: settings.bucketName, isStateChange: true)
+    sendEvent(name: "influxdbToken", value: settings.influxdbToken, isStateChange: true)
+    sendEvent(name: "fromDate", value: settings.fromDate ?: getDefaultFromDate(), isStateChange: true)
+    sendEvent(name: "toDate", value: settings.toDate ?: getDefaultToDate(), isStateChange: true)
+    sendEvent(name: "reportType", value: settings.reportType?: getDefaultReportType(), isStateChange: true)
+    
+    // Reschedule the update flow
+    scheduleUpdate()
+
+    if (settings.enableDebug) {
+        debugLog("Attributes updated successfully with the following values:")
+        debugLog("waterSiteUrl: ${settings.waterSiteUrl}")
+        debugLog("billingId: ${settings.billingId}")
+        debugLog("meterNumber: ${settings.meterNumber}")
+        debugLog("password: [REDACTED]") // For security, don't log sensitive data
+        debugLog("influxdbHost: ${settings.influxdbHost}")
+        debugLog("influxDBPort: ${settings.influxDBPort}")
+        debugLog("orgName: ${settings.orgName}")
+        debugLog("bucketName: ${settings.bucketName}")
+        debugLog("influxdbToken: [REDACTED]") // For security, don't log sensitive data
+        debugLog("fromDate: ${settings.fromDate}")
+        debugLog("toDate: ${settings.toDate}")
+        debugLog("reportType: ${settings.reportType}")
+        debugLog("Scheduling updated based on new preferences.")
+
+    }
+}
+
+
+private void initializeAttributes() {
+    sendEvent(name: "waterSiteUrl", value: settings.waterSiteUrl, isStateChange: true)
+    sendEvent(name: "billingId", value: settings.billingId, isStateChange: true)
+    sendEvent(name: "meterNumber", value: settings.meterNumber, isStateChange: true)
+    sendEvent(name: "password", value: settings.password, isStateChange: true)
+    sendEvent(name: "influxdbHost", value: settings.influxdbHost, isStateChange: true)
+    sendEvent(name: "orgName", value: settings.orgName, isStateChange: true)
+    sendEvent(name: "bucketName", value: settings.bucketName, isStateChange: true)
+    sendEvent(name: "influxdbToken", value: settings.influxdbToken, isStateChange: true)
+    sendEvent(name: "influxDBPort", value: settings.influxDBPort, isStateChange: true)
+    sendEvent(name: "reportType", value: settings.reportType?: getDefaultReportType(), isStateChange: true)
+    sendEvent(name: "fromDate", value: settings.fromDate ?: getDefaultFromDate(), isStateChange: true)
+    sendEvent(name: "toDate", value: settings.toDate ?: getDefaultToDate(), isStateChange: true)
+    if (settings.enableDebug) debugLog("Attributes initialized.")
+}
+
+private void debugLog(String message) {
+    if (settings.enableDebug) {
+        log.debug message
+    }
+}
+
+void refresh() {
+    if (settings.enableDebug) debugLog("Refreshing device page...")
+    sendEvent(name: "refresh", value: "1")
+}
+
+void initialize() {
+    debugLog("Initialize clicked: All cookies will be deleted, 'fromDate' and 'toDate' will reset to defaults, and data will be cleared.")
+    
+    // Delete all cookies
+    deleteAllCookies()
+    
+    // Reset date attributes to defaults
+    resetDatesToDefaults()
+   
+   // Clear data attributes
+    sendEvent(name: "consumptionData", value: "", isStateChange: true)
+    //sendEvent(name: "rawConsumptionData", value: "", isStateChange: true) //not in use
+    state.parsedRecords = null
+
+    // Reset date attributes to defaults
+    sendEvent(name: "fromDate", value: getDefaultFromDate(), isStateChange: true)
+    sendEvent(name: "toDate", value: getDefaultToDate(), isStateChange: true)
+    sendEvent(name: "reportType", value: getDefaultReportType(), isStateChange: true)
+    sendEvent(name: "lastPollDate", value: null)
+    
+    // Schedule the update flow
+    scheduleUpdate()
+    
+    debugLog("Initialization complete. Cookies deleted, dates reset, data cleared , and scheduling set.")
+}
+
+
+
+private void resetDatesToDefaults() {
+    def defaultFromDate = getDefaultFromDate()
+    def defaultToDate = getDefaultToDate()
+    def defaultReportType = getDefaultReportType()
+    
+    sendEvent(name: "fromDate", value: defaultFromDate, isStateChange: true)
+    sendEvent(name: "toDate", value: defaultToDate, isStateChange: true)
+    
+    debugLog("fromDate reset to default: ${defaultFromDate}")
+    debugLog("toDate reset to default: ${defaultToDate}")
+}
+
+//****** define how to delete existing tokens from the device attributes ******************
+void deleteAllCookies() {
+    // Clear cookies by removing their current state
+    device.deleteCurrentState("requestVerificationToken")
+    device.deleteCurrentState("antiforgeryCookie")
+    //device.deleteCurrentState("cultureCookie")
+    device.deleteCurrentState("aspNetCoreCookies")
+    device.deleteCurrentState("infCookie")
+    
+    // Ensure the cleared states are reflected as empty attributes
+    sendEvent(name: "requestVerificationToken", value: "", isStateChange: true)
+    sendEvent(name: "antiforgeryCookie", value: "", isStateChange: true)
+    //sendEvent(name: "cultureCookie", value: "", isStateChange: true)
+    sendEvent(name: "aspNetCoreCookies", value: "", isStateChange: true)
+    sendEvent(name: "infCookie", value: "", isStateChange: true)
+    
+    debugLog("All cookie attributes deleted and cleared.")
+}
+
+// Helper method to calculate default "From Date" as 7 days ago
+def getDefaultFromDate() {
+    def today = LocalDate.now()
+    def fromDate = today.minusDays(7)
+    return fromDate.format(DateTimeFormatter.ofPattern("yyyy-MM-dd"))
+}
+
+// Helper method to calculate default "To Date" as today
+def getDefaultToDate() {
+    def today = LocalDate.now()
+    return today.format(DateTimeFormatter.ofPattern("yyyy-MM-dd"))
+}
+
+def getDefaultReportType() {
+        return 1
+}
+
+
+void getConsumptionDataManually() {
+    debugLog("Manual update initiated.")
+    // Use device attributes for manual runs
+    def fromDate = device.currentValue("fromDate") ?: ""
+    def toDate = device.currentValue("toDate") ?: ""
+    def reportType = device.currentValue("reportType") ?: ""
+    debugLog "fromDate is :${fromDate}, toDate is: ${toDate} , reportType is: ${reportType}"
+    if (!fromDate || !toDate || !reportType) {
+        log.error "Required attributes (fromDate, toDate, reportType) are missing for manual run."
+        return
+    }
+
+    startDataCollection(fromDate, toDate, reportType, false)
+}
+
+
+
+
+/********************** Scheduling Functions ****************************************************/
+void scheduleUpdate() {
+    unschedule() // Remove any existing schedules
+    def frequency = settings.updateFrequency ?: 6
+    if (frequency <= 0) {
+        log.warn "Invalid update frequency. Scheduling skipped."
+        return
+    }
+    
+    // For testing, schedule every 2 minutes
+    //schedule("0 */2 * * * ?", "triggerScheduledUpdate") // Cron expression for every 2 minutes
+    //log.info "Scheduling update every 2 minutes for testing purposes."
+    
+    // Original scheduling for every X hours (commented out for now)
+    schedule("0 0 0/${frequency} * * ?", "triggerScheduledUpdate") // Cron expression for every X hours
+    log.info "Scheduling update every ${frequency} hours."
+}
+
+void triggerScheduledUpdate() {
+    debugLog("Scheduled flow triggered.")
+    
+    // Calculate dynamic dates for scheduled runs
+    def today = LocalDate.now()
+    def fromDate = today.minusDays(7).format(DateTimeFormatter.ofPattern("yyyy-MM-dd"))
+    def toDate = today.format(DateTimeFormatter.ofPattern("yyyy-MM-dd"))
+    def reportType = 1 // Scheduled runs always fetch daily consumption data
+    debugLog "Updated reportType to: ${reportType}"
+
+    // Start the data collection process with dynamic parameters
+    runIn(1, "startDataCollection", [data: [fromDate: fromDate, toDate: toDate, reportType: reportType, scheduledRun: true]])
+}
+
+
+/********************** Data Collection Flow ****************************************************/
+void startDataCollection(def fromDate = null, def toDate = null, def reportType = null, def scheduledRun = false) {
+    // Handle cases where a Map is passed instead of individual arguments
+    if (fromDate instanceof Map) {
+        def params = fromDate
+        fromDate = params.fromDate
+        toDate = params.toDate
+        reportType = params.reportType
+        scheduledRun = params.scheduledRun ?: false
+    }
+
+    // Ensure mandatory parameters are provided
+    if (!fromDate || !toDate || !reportType) {
+        log.error "Missing required parameters for data collection: fromDate=${fromDate}, toDate=${toDate}, reportType=${reportType}"
+        return
+    }
+
+    // Ensure all cookies are cleared before starting the process
+    deleteAllCookies()
+
+    // Store parameters in state for use during the flow
+    state.runParams = [
+        fromDate    : fromDate,
+        toDate      : toDate,
+        reportType  : reportType,
+        scheduledRun: scheduledRun
+    ]
+
+    debugLog("Starting data collection: fromDate=${fromDate}, toDate=${toDate}, reportType=${reportType}, scheduledRun=${scheduledRun}")
+    GetInitialTokens()
+}
+
+
+/*****************Simulate entering the site URL to retrieve Verification and Antiforgery Cookies*****************/
+
+void GetInitialTokens() {
+    if (!settings.waterSiteUrl) {
+        log.error "Water Site URL is missing. Please configure the device settings."
+        return
+    }
+
+    def loginUri = "${settings.waterSiteUrl}/account/login"
+    debugLog "Requesting login page: ${loginUri}"
+
+    try {
+        httpGet([uri: loginUri, textParser: true, timeout: 30]) { response ->
+            debugLog "Response Status: ${response.status}"
+
+            if (response.status != 200) {
+                log.error "Unexpected response status: ${response.status}"
+                return
+            }
+
+            def setCookieHeaders = response.headers.findAll { it.name.equalsIgnoreCase("Set-Cookie") }
+            def antiforgeryToken = extractAntiforgeryTokenFromSetCookie(setCookieHeaders)
+            def verificationToken = extractVerificationToken(response.data.text)
+
+            if (antiforgeryToken && verificationToken) {
+                sendEvent(name: "antiforgeryCookie", value: antiforgeryToken, isStateChange: true)
+                log.info "antiforgeryToken updated successfully"
+                sendEvent(name: "requestVerificationToken", value: verificationToken, isStateChange: true)
+                log.info "verificationToken updated successfully"
+                
+                runIn(5, "performLogin")
+            } else {
+                log.error "Both tokens are required to proceed with login."
+            }
+        }
+    } catch (Exception e) {
+        log.error "Error during token extraction: ${e.message}"
+    }
+}
+
+
+private String extractAntiforgeryTokenFromSetCookie(def setCookieHeaders) {
+    if (setCookieHeaders) {
+        // Process each Set-Cookie header to find the antiforgery token
+        for (header in setCookieHeaders) {
+            try {
+                if (header.toString().contains(".AspNetCore.Antiforgery")) {
+                    def token = header.toString().split(";")[0].split("=")[1]
+                    return token
+                }
+            } catch (Exception e) {
+                log.error "Error parsing antiforgery token: ${e.message}"
+            }
+        }
+    }
+    log.error "Antiforgery Token not found in Set-Cookie headers."
+    return null
+}
+
+
+
+private String extractVerificationToken(String body) {
+    try {
+        def regex = /name="__RequestVerificationToken" type="hidden" value="([^"]+)"/
+        def match = body =~ regex
+        return match ? match[0][1] : null
+    } catch (Exception e) {
+        log.error "Error extracting verification token: ${e.message}"
+        return null
+    }
+}
+
+
+/***********************Perform Login to retrieve Inf and aspNetCore Cookies*******************************************************************************/
+
+void performLogin() {
+    debugLog("Initiating login process.")
+    def antiforgeryToken = device.currentValue("antiforgeryCookie")
+    def requestVerificationToken = device.currentValue("requestVerificationToken")
+    def billingId = settings.billingId
+    def meterNumber = settings.meterNumber
+    def password = settings.password
+
+    if (!antiforgeryToken || !requestVerificationToken || !billingId || !meterNumber || !password) {
+        log.error "Cannot perform login POST request: Missing required attributes or tokens."
+        return
+    }
+
+    def headers = [
+        "Cache-Control" : "max-age=0",
+        "Connection"    : "keep-alive",
+        "Content-Type": "application/x-www-form-urlencoded",
+        "Cookie"        : ".AspNetCore.Antiforgery.TiHuan8tUsI=${antiforgeryToken}; .AspNetCore.Culture=c%3Dhe-IL%7Cuic%3Dhe-IL;",
+        "Referer"     : "${settings.waterSiteUrl}/Account/Login"
+    ]
+
+    def payload = [
+        "BillingId"                  : billingId,
+        "MeterNumber"                : meterNumber,
+        "Password"                   : password,
+        "__RequestVerificationToken" : requestVerificationToken,
+        "RememberMe"                 : "false"
+    ]
+    debugLog("Preparing to send POST request")
+    debugLog("POST Headers: ${headers}")
+    debugLog("POST Payload: ${payload}")
+    try {
+        httpPost([
+            uri: "${settings.waterSiteUrl}/Account/Login",
+            headers: headers,
+            body: payload,
+            followRedirects: false
+        ]) { response ->
+            debugLog "Response status is: ${response.status}"
+            if (response.status == 302) {
+                def setCookieHeaders = response.headers.findAll { it.name.equalsIgnoreCase("Set-Cookie") }
+                def aspNetCoreCookies = extractCookie(setCookieHeaders, ".AspNetCore.Cookies")
+                def infCookie = extractCookie(setCookieHeaders, "Inf")
+
+                if (aspNetCoreCookies && infCookie) {
+                    sendEvent(name: "aspNetCoreCookies", value: aspNetCoreCookies, isStateChange: true)
+                    log.info "aspNetCoreCookies updated successfully"
+                    sendEvent(name: "infCookie", value: infCookie, isStateChange: true)
+                    log.info "infCookie updated successfully"
+                    runIn(3, "getConsumptionData")
+                } else {
+                    log.error "Missing cookies required for data retrieval."
+                }
+            } else {
+                log.error "Unexpected response status during login: ${response.status}"
+            }
+        }
+    } catch (Exception e) {
+        log.error "Error during login POST request: ${e.message}"
+    }
+}
+
+private String extractCookie(List setCookieHeaders, String cookieName) {
+    if (!setCookieHeaders) {
+        log.error "Set-Cookie headers are missing."
+        return null
+    }
+
+    for (header in setCookieHeaders) {
+        try {
+            def headerValue = header.toString()
+            if (headerValue.contains("${cookieName}=")) {
+                def cookieValue = headerValue.split(";")[0].split("=")[1]
+                debugLog "Extracted ${cookieName}: ${cookieValue}"
+                return cookieValue
+            }
+        } catch (Exception e) {
+            log.error "Error extracting cookie ${cookieName}: ${e.message}"
+        }
+    }
+
+    log.error "Cookie ${cookieName} not found in Set-Cookie headers."
+    return null
+}
+
+/***********************Send Post request to get Consumption Data*******************************************************************************/
+void getConsumptionData() {
+    def runParams = state.runParams ?: [:]
+    def fromDate = runParams.fromDate ?: device.currentValue("fromDate")
+    def toDate = runParams.toDate ?: device.currentValue("toDate")
+    def reportType = runParams.reportType ?: device.currentValue("reportType")
+    debugLog "In getConsumptionData function runParams.reportType is: ${runParams.reportType} and device.currentValue is: ${device.currentValue}"
+    def cookieHeader = ".AspNetCore.Antiforgery.TiHuan8tUsI=${device.currentValue('antiforgeryCookie')}; " +
+                       ".AspNetCore.Cookies=${device.currentValue('aspNetCoreCookies')}; " +
+                       "Inf=${device.currentValue('infCookie')}"
+
+    def requestHeaders = [
+        "Content-Type" : "application/x-www-form-urlencoded",
+        "Cookie"       : cookieHeader,
+        "Referer"      : "${settings.waterSiteUrl}/reports"
+    ]
+
+    def requestBody = "ReportType=${reportType}&from=${fromDate}&to=${toDate}&__RequestVerificationToken=${device.currentValue('requestVerificationToken')}"
+
+    try {
+        httpPost([
+            uri: "${settings.waterSiteUrl}/reports",
+            headers: requestHeaders,
+            body: requestBody,
+            textParser: true
+        ]) { response ->
+            if (response.status == 200) {
+                parseConsumptionData(response.data.text)
+            } else {
+                log.error "Unexpected response status: ${response.status}"
+            }
+        }
+    } catch (Exception e) {
+        log.error "Error during data retrieval: ${e.message}"
+    }
+}
+
+
+/***********************Parse and the Consumption Data*******************************************/
+private void parseConsumptionData(String htmlResponse) {
+    try {
+        debugLog "Parsing consumption data from HTML response."
+        
+        // Match the table with id="data-table"
+        def tableMatch = htmlResponse =~ /<table[^>]*id=["']data-table["'][^>]*>([\s\S]*?)<\/table>/
+        if (tableMatch && tableMatch[0][1]) {
+            def tableContent = tableMatch[0][1]
+            def rows = tableContent.findAll(/<tr>([\s\S]*?)<\/tr>/)
+            def consumptionData = []
+
+            rows.each { row ->
+                def columns = (row =~ /<td>(.*?)<\/td>/).collect { it[1].trim() }
+                if (columns.size() == 2) {
+                    def date = columns[0]
+                    def consumption = columns[1]?.isDouble() ? columns[1].toDouble() : null
+
+                    if (consumption != null) {
+                        consumptionData << [date: date, consumption: consumption]
+                    }
+                }
+            }
+
+           if (consumptionData) {
+    		log.info "Extracted Consumption Data: ${consumptionData}"
+
+    		// Save full consumption string
+    		sendEvent(name: "consumptionData", value: consumptionData.collect { "${it.date}:${it.consumption}" }.join("# "), isStateChange: true)
+
+            // Find the most recent date in parsed data
+            def latestRecord = consumptionData.max { a, b -> 
+                Date.parse("yyyy-MM-dd", a.date) <=> Date.parse("yyyy-MM-dd", b.date)
+            }
+
+            if (latestRecord) {
+                def newDate = latestRecord.date
+                def newValue = latestRecord.consumption
+                def existingDate = device.currentValue("lastConsumptionDate")
+
+                boolean shouldUpdate = true
+                if (existingDate) {
+                    try {
+                        def existing = Date.parse("yyyy-MM-dd", existingDate)
+                        def incoming = Date.parse("yyyy-MM-dd", newDate)
+                        shouldUpdate = incoming.after(existing)
+                    } catch (Exception e) {
+                        log.warn "Failed to compare lastConsumptionDate. Will proceed to update. Error: ${e.message}"
+                    }
+                }
+
+                if (shouldUpdate) {
+                    sendEvent(name: "lastConsumptionDate", value: newDate, isStateChange: true)
+                    sendEvent(name: "lastConsumptionValue", value: newValue, isStateChange: true)
+                    log.info "Updated lastConsumptionDate to ${newDate} and lastConsumptionValue to ${newValue}"
+                } else {
+                    debugLog "Fetched data is not newer than stored lastConsumptionDate (${existingDate}). Skipping update."
+                }
+            }
+
+            // Schedule InfluxDB push
+            runIn(2, postDataToInfluxDB)
+        }
+ 		else {
+                log.error "No valid consumption data found in the table rows."
+            }
+        } else {
+            log.error "Failed to find the consumption table in the response."
+        }
+    } catch (Exception e) {
+        log.error "Error parsing consumption data: ${e.message}"
+    }
+}
+
+
+
+/*def saveConsumptionData(consumptionData) {
+    try {
+        // Format the extracted data as a single string
+        def formattedData = consumptionData.collect { entry ->
+            "${entry.date}:${entry.consumption}"
+        }.join("#")
+        
+        // Save the formatted data to the device attribute
+        sendEvent(name: "consumptionData", value: formattedData, isStateChange: true)
+        log.info "Consumption data saved to attribute: ${formattedData}"
+        
+        // Invoke the postDataToInfluxDB method
+        postDataToInfluxDB()
+    } catch (Exception e) {
+        log.error "Error saving consumption data: ${e.message}"
+    }
+}
+*/
+
+//****** Prepare and send data to InfluxDB according to device attributes*******************
+void postDataToInfluxDB() {
+    debugLog("postDataToInfluxDB function invoked.")
+    
+    def data = device.currentValue("consumptionData")
+    def meterNumber = device.currentValue("meterNumber")
+    def reportType = state.runParams?.reportType ?: 1 // Default to 1 if not set in state
+    
+    if (reportType != 1) {
+        log.info "Did not send to InfluxDB as report type is not 1 (Daily). Current reportType: ${reportType}"
+        return
+    }
+    if (!data) {
+        log.error "No consumption data available to post."
+        return
+    }
+    
+    try {
+        // Parse the data string into a list of maps
+        def records = data.split('#').collect { entry ->
+            def (date, consumption) = entry.split(':')
+            [date: date.trim(), consumption: consumption.toDouble()]
+        }
+        
+        // Store parsed records temporarily in a state variable
+        state.parsedRecords = records
+        state.meterNumber = meterNumber
+        
+        // Schedule the payload preparation and posting with a delay to make sure data in received completly before prepared
+        runIn(2, prepareAndSendToInfluxDB)
+    } catch (Exception e) {
+        log.error "Error parsing data for InfluxDB: ${e.message}"
+    }
+}
+
+
+void prepareAndSendToInfluxDB() {
+    debugLog("Preparing data for InfluxDB after delay.")
+    
+    def records = state.parsedRecords
+    def meterNumber = state.meterNumber
+    
+    if (!records || !meterNumber) {
+        log.error "Parsed records or meter number missing."
+        return
+    }
+    
+    try {
+        // Construct InfluxDB line protocol format with consistent timestamps
+        def influxLines = records.collect { record ->
+            // Parse the date string (original format: yyyy-MM-dd)
+            def dateObject = Date.parse("yyyy-MM-dd", record.date)
+            
+            // Convert date's midnight timestamp to nanoseconds for InfluxDB
+            def timestamp = dateObject.time * 1_000_000L
+
+            // Extract month and year for month_year (MM/YY)
+            def month = dateObject.format('MM')
+            def yy = dateObject.format('yy')
+            def month_year = "${month}/${yy}"
+
+            // Reformat the date to DD-MM-YYYY
+            def formattedDate = dateObject.format('dd-MM-yyyy')
+
+            // Construct the line protocol entry
+            return "daily_consumption,meter=${meterNumber} consumption=${record.consumption},date=\"${formattedDate}\",month_year=\"${month_year}\" ${timestamp}"
+        }
+        
+        def influxBody = influxLines.join("\n") // Use newline separator
+        log.info "Prepared InfluxDB Payload:\n${influxBody}"
+        //debugLog("Prepared InfluxDB Payload:\n${influxBody}")
+        
+        // Prepare HTTP request for InfluxDB
+        def uri = buildInfluxDBURI()
+        def headers = [
+            "Authorization": "Token ${device.currentValue("influxdbToken")}",
+            "Content-Type": "text/plain"
+        ]
+        
+        // Send data to InfluxDB
+        asynchttpPost("handleInfluxResponse", [
+            uri: uri,
+            requestContentType: "text/plain",
+            headers: headers,
+            body: influxBody
+        ])
+    } catch (Exception e) {
+        log.error "Error preparing data for InfluxDB: ${e.message}"
+    }
+}
+
+
+void handleInfluxResponse(hubResponse, data) {
+    if (hubResponse.status < 400) {
+        //debugLog("Data successfully posted to InfluxDB.")
+        log.info "Data successfully posted to InfluxDB"
+        def now = new Date().format("dd-MM-yyyy HH:mm:ss", location.timeZone)
+        sendEvent(name: "lastPollDate", value: now)
+    } else {
+        log.error "Failed to post data to InfluxDB: Status ${hubResponse.status}, Error: ${hubResponse.errorMessage}"
+        debugLog("Response Details: ${hubResponse.data}")
+    }
+}
+
+private String formatDataForInfluxDB(parsedRecords, meterNumber) {
+    return parsedRecords.collect { record ->
+        "daily_consumption,meter=${meterNumber} consumption=${record.consumption},date=\"${record.date}\""
+    }.join("\n")
+}
+
+
+private String buildInfluxDBURI() {
+    def protocol = settings.influxdbHost.startsWith("https") ? "https" : "http"
+    def port = device.currentValue("influxDBPort") ?: 8086 // Use the attribute value or default to 8086
+    return "${protocol}://${settings.influxdbHost}:${port}/api/v2/write?org=${settings.orgName}&bucket=${settings.bucketName}"
+}
